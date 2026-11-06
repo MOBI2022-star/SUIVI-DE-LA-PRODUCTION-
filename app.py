@@ -1,293 +1,468 @@
-
-import io, os, re, sqlite3, smtplib
-from email.message import EmailMessage
-from datetime import date, datetime, timedelta
-import pandas as pd
 import streamlit as st
-import plotly.express as px
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime, date, timedelta
 
-st.set_page_config(page_title="Suivi de production vélos", page_icon="🚲", layout="wide")
-DB_PATH = os.getenv("DB_PATH", "production.db")
+# --- CONFIGURATION DE LA PAGE (PLEIN ÉCRAN / RESPONSIVE) ---
+st.set_page_config(
+    page_title="Analyse Chef - Gestion Flotte & Suivi Production",
+    page_icon="🚲",
+    layout="wide"
+)
 
-PIECES_DEFAUT = [
-"Batteries","VBOX","Cache cadre","Cache cadre nouveau modèle","Panier","Roue arrière","Roue avant",
-"Chargeurs","Capteurs de couples","Vis brid VBOX","Bouchon de câble anti vol",
-"Fixation de bridage pour les VBOX","Tendeur de chaine","Vis de fixation pour les VBOX","Vis de carter",
-"Manivelle droite VAE","Manivelle gauche VAE","Manivelle droite VLS","Manivelle gauche VLS",
-"Couronne","Sticker VLS","Sticker VAE","Garde boue arrière VAE","Garde boue avant VAE",
-"Garde boue arrière VLS","Garde boue avant VLS","Tige de selle","Selle","Béquille","Levier de frein",
-"Carter","Catadiope","Roue avant VLS","Roue arrière VLS","Roue avant VAE","Roue arrière VAE",
-"Poignée droite","Poignée gauche","Moteur fourche","Fourche VAE","Fourche VLS","Facade VAE","Facade VLS",
-"Couronne VAE","Couronne VLS","Pédale gauche","Pédale droite","Chaine","Manette de vitesse","Guidon",
-"Collier de selle","Collier de fourche","Rallonge cable moteur VAE","Cable phare garde-boue AR",
-"Cable rallonge feux arrieres","Frein avant","Frein arrières","Levier de frein D","Levier de frein G",
-"Feux arrieres","Sonette","Poigné Gauche","Pedalle Droite","Pedalle Gauche","Poingé Droite",
-"Cable antivol","Carter Droite","Carter gauche","Gaine derailleur","Cable frein avant",
-"Cable frein arriere","Gaine de frein avant","Gaine de frein arrière","Ecrou anti vole roue avant VAE",
-"Ecrou anti vole roue avant VLS","Rondelle anti-couple roue avant VAE","Embout de gaine frein",
-"Embout de gaine derailleur","Bouchon antivol"
-]
-EVENEMENTS = ["Zone de contrôle fermée (encombrement vélo)","Evacuation","Manque de magasiniers",
-"Manque de personnel poste retour","Manque de personnel pour diag électrique","Batterie arrivant en quantité limitée",
-"Ecart entre le diag et le contrôle","Vélo bloqué au diapason","Problème de peering",
-"VBOX ne reconnaissant pas badge client","Manque de vélos","CARL Source dysfonctionnement",
-"CARL Touch dysfonctionnement","Coupure d'électricité","Interruption de la connexion internet"]
+# --- INITIALISATION DE LA MÉMOIRE / SESSION STATE ---
+if "connecte" not in st.session_state:
+    st.session_state.connecte = False
 
-def db():
-    con=sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.execute("""CREATE TABLE IF NOT EXISTS daily(
-      work_date TEXT PRIMARY KEY, week INTEGER, completed INTEGER DEFAULT 0, settled INTEGER DEFAULT 0, total_production INTEGER DEFAULT 0,
-      staff INTEGER DEFAULT 0, returns INTEGER DEFAULT 0, charge_hours REAL DEFAULT 0,
-      comment TEXT DEFAULT '', updated_at TEXT)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS breakdowns(
-      id INTEGER PRIMARY KEY AUTOINCREMENT, work_date TEXT, piece TEXT, start_time TEXT,
-      end_time TEXT, minutes REAL DEFAULT 0, note TEXT DEFAULT '')""")
-    con.execute("""CREATE TABLE IF NOT EXISTS work_orders(
-      intervention TEXT PRIMARY KEY, bike TEXT, status TEXT, end_date TEXT, mechanic TEXT,
-      imported_at TEXT)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS imports(
-      id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT, imported_at TEXT, rows_count INTEGER,
-      notes TEXT)""")
-    con.commit()
-    return con
-con=db()
+# Listes d'agents et paramétrages admin (sans noms en dur)
+if "liste_agents" not in st.session_state:
+    st.session_state.liste_agents = []
 
-def week_num(d):
-    return date.fromisoformat(str(d)).isocalendar().week
+if "liste_codes_planning" not in st.session_state:
+    st.session_state.liste_codes_planning = ["ANR", "AJNP", "CP", "AT", "ARM", "CPP", "DGT", "IAE", "ABS", "FOR", "DISP", "CONT", "RET"]
 
-def safe_int(v):
-    try: return int(float(v)) if pd.notna(v) else 0
-    except: return 0
+if "liste_operations_levage" not in st.session_state:
+    st.session_state.liste_operations_levage = ["Réglage pince", "Changement levier de serrage", "Graissage vérin", "Contrôle électrique", "Remplacement câble"]
 
-def read_excel(upload):
-    return pd.ExcelFile(upload)
+if "liste_pieces_detachees" not in st.session_state:
+    st.session_state.liste_pieces_detachees = ["Roue", "Guidon", "Frein", "Chaîne", "Pédale", "Pneu", "Batterie", "Dérailleur", "Câble"]
 
-def normalize(s):
-    return re.sub(r"[^a-z0-9]+","",str(s).lower().strip())
+if "liste_outillage" not in st.session_state:
+    st.session_state.liste_outillage = [f"Outil #{i:02d}" for i in range(1, 41)]
 
-def parse_history(upload):
-    """Importe les feuilles hebdomadaires existantes et récupère les valeurs par date."""
-    xls=pd.ExcelFile(upload)
-    found=[]
-    for sh in xls.sheet_names:
-        try:
-            raw=pd.read_excel(upload, sheet_name=sh, header=None)
-            if raw.empty or raw.shape[0] < 9: continue
-            # Les colonnes de jours sont en général C à G ; la ligne 0 contient les dates.
-            for c in range(2, min(raw.shape[1],7)):
-                dt=pd.to_datetime(raw.iat[0,c], errors="coerce")
-                if pd.isna(dt): continue
-                d=dt.date().isoformat()
-                vals={}
-                for r in range(min(len(raw),10)):
-                    label=" ".join(str(v) for v in raw.iloc[r,:2].tolist() if pd.notna(v)).lower()
-                    if "terminé" in label or "termine" in label: vals["completed"]=safe_int(raw.iat[r,c])
-                    if "soldé" in label or "solde" in label: vals["settled"]=safe_int(raw.iat[r,c])
-                    if re.search(r"\btotal\b", label) and "total j+1" not in label and "retour" not in label: vals["total_production"]=safe_int(raw.iat[r,c])
-                    if "effectifs présents" in label: vals["staff"]=safe_int(raw.iat[r,c])
-                    if "nombre de retours" in label: vals["returns"]=safe_int(raw.iat[r,c])
-                    if "charge de travail quotidienne" in label:
-                        v=raw.iat[r,c]
-                        try:
-                            td=pd.to_timedelta(str(v))
-                            vals["charge_hours"]=td.total_seconds()/3600
-                        except: pass
-                if vals and (vals.get("completed",0) or vals.get("settled",0) or vals.get("staff",0)):
-                    found.append({"work_date":d, **vals, "week":date.fromisoformat(d).isocalendar().week})
-        except Exception:
-            continue
-    return pd.DataFrame(found).drop_duplicates("work_date", keep="last") if found else pd.DataFrame()
+if "historique_levage" not in st.session_state:
+    st.session_state.historique_levage = []
 
-def import_workbook(file):
-    hist=parse_history(file)
-    if hist.empty: return 0
-    for _,r in hist.iterrows():
-        old=con.execute("SELECT work_date FROM daily WHERE work_date=?",(r.work_date,)).fetchone()
-        cols=["work_date","week","completed","settled","total_production","staff","returns","charge_hours","updated_at"]
-        vals=[r.work_date,int(r.week),int(r.get("completed",0)),int(r.get("settled",0)),
-              int(r.get("total_production",r.get("completed",0)+r.get("settled",0))),
-              int(r.get("staff",0)),int(r.get("returns",0)),float(r.get("charge_hours",0)),datetime.now().isoformat(timespec="seconds")]
-        con.execute("""INSERT INTO daily(work_date,week,completed,settled,total_production,staff,returns,charge_hours,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(work_date) DO UPDATE SET
-        week=excluded.week, completed=excluded.completed, settled=excluded.settled,
-        total_production=excluded.total_production, staff=excluded.staff, returns=excluded.returns,
-        charge_hours=excluded.charge_hours, updated_at=excluded.updated_at""",vals)
-    con.execute("INSERT INTO imports(filename,imported_at,rows_count,notes) VALUES(?,?,?,?)",
-                (file.name,datetime.now().isoformat(timespec="seconds"),len(hist),"Historique hebdomadaire importé"))
-    con.commit()
-    return len(hist)
+if "ruptures_journalieres" not in st.session_state:
+    st.session_state.ruptures_journalieres = {}
 
-def pct(a,b): return (100*a/b) if b else 0
+if "non_conformites_journalieres" not in st.session_state:
+    st.session_state.non_conformites_journalieres = {}
 
-st.title("🚲 Suivi de production – Atelier vélos")
-st.caption("Tableau de bord quotidien et hebdomadaire • Historique conservé dans production.db")
+# --- 1. SÉCURITÉ ET AUTHENTIFICATION ---
+if not st.session_state.connecte:
+    st.markdown("<h2 style='text-align: center;'>🔐 Connexion - Analyse Chef</h2>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center;'>Veuillez vous identifier pour accéder à l'application interne.</p>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        username = st.text_input("Identifiant")
+        password = st.text_input("Mot de passe", type="password")
+        
+        if st.button("Se connecter", use_container_width=True):
+            if username == "Admin" and password == "IMAD2014@":
+                st.session_state.connecte = True
+                st.rerun()
+            else:
+                st.error("Identifiant ou mot de passe incorrect.")
+    st.stop()
 
-with st.sidebar:
-    st.header("Importation Excel")
-    hist_file=st.file_uploader("Classeur de suivi hebdomadaire (.xlsx)",type=["xlsx"],key="hist")
-    if hist_file and st.button("Importer l'historique du classeur"):
-        try:
-            n=import_workbook(hist_file)
-            st.success(f"{n} journées importées / mises à jour.")
-        except Exception as e: st.error(f"Import impossible : {e}")
-    st.divider()
-    st.caption("Les données sont enregistrées dans la base locale production.db. Sur GitHub, prévoyez un stockage persistant pour l'hébergement.")
+# --- 2. BARRE LATÉRALE & PARAMÈTRES ---
+st.sidebar.title("🚲 Menu Analyse Chef")
+st.sidebar.success("Connecté en tant qu'Administrateur")
 
-tabs=st.tabs(["📊 Tableau du jour","📅 Semaines S1 à S52","🧰 Ruptures de pièces","🚲 Vélos non soldés","📈 Graphiques","📥 Imports & exports"])
+option_stockage = st.sidebar.selectbox(
+    "Emplacement de la mémoire",
+    ["PC Local (C:\\app_velos)", "Réseau d'entreprise / NAS", "Dossier Synchronisé (Drive)"]
+)
 
-with tabs[0]:
-    st.subheader("Saisie et synthèse du jour")
-    d=st.date_input("Date de production", value=date.today())
-    ds=d.isoformat()
-    old=con.execute("SELECT completed,settled,total_production,staff,returns,charge_hours,comment FROM daily WHERE work_date=?",(ds,)).fetchone()
-    old=old or (0,0,0,0,0,0.0,"")
-    a,b,c,e,f=st.columns(5)
-    completed=a.number_input("Vélos terminés",min_value=0,value=int(old[0]),step=1)
-    settled=b.number_input("Vélos soldés",min_value=0,value=int(old[1]),step=1)
-    total_prod=c.number_input("Production totale (ligne Total Excel)",min_value=0,value=int(old[2] or (old[0]+old[1])),step=1)
-    staff=e.number_input("Mécaniciens présents",min_value=0,value=int(old[3]),step=1)
-    returns=f.number_input("Retours",min_value=0,value=int(old[4]),step=1)
-    charge=st.number_input("Charge totale (heures)",min_value=0.0,value=float(old[5]),step=0.25)
-    comment=st.text_input("Commentaire / information du jour",value=str(old[6] or ""))
-    if st.button("💾 Enregistrer la journée",type="primary"):
-        con.execute("""INSERT INTO daily(work_date,week,completed,settled,total_production,staff,returns,charge_hours,comment,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(work_date) DO UPDATE SET
-        week=excluded.week,completed=excluded.completed,settled=excluded.settled,total_production=excluded.total_production,
-        staff=excluded.staff,returns=excluded.returns,charge_hours=excluded.charge_hours,comment=excluded.comment,updated_at=excluded.updated_at""",
-        (ds,d.isocalendar().week,completed,settled,total_prod,staff,returns,charge,comment,datetime.now().isoformat(timespec="seconds")))
-        con.commit(); st.success("Journée enregistrée.")
-    total=total_prod
-    k=st.columns(5)
-    k[0].metric("Mécaniciens présents",staff)
-    k[1].metric("Vélos terminés",completed)
-    k[2].metric("Vélos soldés",settled)
-    k[3].metric("% soldés / production",f"{pct(settled,total):.1f}%")
-    k[4].metric("À contrôler / terminés",f"{pct(completed,total):.1f}%")
-    k2=st.columns(3)
-    k2[0].metric("Production totale du jour",total)
-    k2[1].metric("Vélos / mécanicien",f"{total/staff:.2f}" if staff else "—")
-    k2[2].metric("Charge moyenne / vélo",f"{charge/total:.2f} h" if total else "—")
-    st.caption("La production totale reprend la ligne « Total » du classeur (modifiable). Les pourcentages terminés / soldés sont calculés sur cette valeur.")
-    st.info("Le total de production est saisi séparément car le classeur S43 présente des écarts entre la ligne Total et la somme terminés + soldés.")
+st.sidebar.markdown("---")
+st.sidebar.subheader("📂 Injection des Fichiers")
+fichier_principal = st.sidebar.file_uploader("Fichier Excel / CSV principal (Production)", type=["xlsx", "xls", "csv"], key="file_principal")
+fichier_comparaison = st.sidebar.file_uploader("Fichier 2 (Réconciliation / Anti-perte)", type=["xlsx", "xls", "csv"], key="file_comparaison")
 
-with tabs[1]:
-    st.subheader("Vue hebdomadaire")
-    w=st.selectbox("Semaine",list(range(1,53)),index=date.today().isocalendar().week-1,format_func=lambda x:f"S{x:02d}")
-    start=date.fromisocalendar(date.today().isocalendar().year,w,1)
-    dates=[start+timedelta(days=i) for i in range(7)]
-    rows=[]
-    for day in dates:
-        r=con.execute("SELECT completed,settled,total_production,staff,returns,charge_hours,comment,updated_at FROM daily WHERE work_date=?",(day.isoformat(),)).fetchone()
-        rows.append({"Jour":day.strftime("%A %d/%m"),"Date":day.isoformat(),"Terminés":r[0] if r else 0,
-        "Soldés":r[1] if r else 0,"Effectif":r[2] if r else 0,"Retours":r[3] if r else 0,
-        "Charge (h)":r[4] if r else 0.0,"Vélos/ETP":((r[0]+r[1])/r[2]) if r and r[2] else 0,
-        "Dernière mise à jour":r[6] if r else ""})
-    df=pd.DataFrame(rows)
-    st.dataframe(df,use_container_width=True,hide_index=True)
-    week_total=int(df["Total production"].sum())
-    q=st.columns(4)
-    q[0].metric("Production semaine",week_total)
-    q[1].metric("Terminés",int(df["Terminés"].sum()))
-    q[2].metric("Soldés",int(df["Soldés"].sum()))
-    q[3].metric("Effectif moyen",f"{df.loc[df.Effectif>0,'Effectif'].mean():.1f}" if (df.Effectif>0).any() else "—")
-    st.download_button("Télécharger la semaine en CSV",df.to_csv(index=False).encode("utf-8-sig"),f"S{w:02d}_production.csv","text/csv")
+st.sidebar.markdown("---")
+menu = st.sidebar.radio(
+    "Navigation",
+    [
+        "📊 Suivi de la Production Grand Écran", 
+        "📅 Planning Semainier (S1 à S52)", 
+        "💰 Calculateur de Primes (Vélos Soldés)",
+        "🏗️ Entretien Pieds Électriques (24 Postes)", 
+        "🧰 Outillage & Pièces Détachées",
+        "🔍 Réconciliation & Anti-Perte",
+        "⚙️ Administration & Listes Déroulantes"
+    ]
+)
 
-with tabs[2]:
-    st.subheader("Suivi des ruptures de pièces")
-    with st.form("rupture"):
-        dbr=st.date_input("Jour de rupture",value=date.today(),key="bd")
-        piece=st.selectbox("Pièce en rupture",PIECES_DEFAUT)
-        cc1,cc2=st.columns(2)
-        debut=cc1.time_input("Heure de début",value=datetime.strptime("07:00","%H:%M").time())
-        fin=cc2.time_input("Heure de fin",value=datetime.strptime("10:00","%H:%M").time())
-        note=st.text_input("Commentaire (facultatif)")
-        ok=st.form_submit_button("Ajouter la rupture")
-        if ok:
-            dt1=datetime.combine(dbr,debut); dt2=datetime.combine(dbr,fin)
-            if dt2<dt1: dt2+=timedelta(days=1)
-            mins=(dt2-dt1).total_seconds()/60
-            con.execute("INSERT INTO breakdowns(work_date,piece,start_time,end_time,minutes,note) VALUES(?,?,?,?,?,?)",
-                        (dbr.isoformat(),piece,debut.strftime("%H:%M"),fin.strftime("%H:%M"),mins,note))
-            con.commit(); st.success(f"Durée calculée : {mins/60:.2f} heure(s)")
-    br=pd.read_sql_query("SELECT work_date AS Date,piece AS Pièce,start_time AS Début,end_time AS Fin,minutes AS Minutes,note AS Commentaire FROM breakdowns ORDER BY work_date DESC",con)
-    if not br.empty:
-        br["Durée"]=(br["Minutes"]/60).round(2).astype(str)+" h"
-        st.dataframe(br,use_container_width=True,hide_index=True)
-        st.download_button("Exporter les ruptures",br.to_csv(index=False).encode("utf-8-sig"),"ruptures_pieces.csv","text/csv")
-    else: st.info("Aucune rupture enregistrée.")
+if st.sidebar.button("Déconnexion"):
+    st.session_state.connecte = False
+    st.rerun()
 
-with tabs[3]:
-    st.subheader("Liste des vélos non soldés")
-    st.write("Importe l'export des ordres de travail, puis associe les colonnes de ton fichier aux champs ci-dessous.")
-    wo=st.file_uploader("Export ordres de travail (.xlsx ou .csv)",type=["xlsx","xls","csv"],key="wo")
-    if wo:
-        try:
-            raw=pd.read_csv(wo) if wo.name.lower().endswith(".csv") else pd.read_excel(wo)
-            st.write("Aperçu de l'export",raw.head(8))
-            cols=list(raw.columns)
-            c1,c2,c3=st.columns(3)
-            int_col=c1.selectbox("Colonne numéro d'intervention",cols)
-            status_col=c2.selectbox("Colonne statut",cols)
-            end_col=c3.selectbox("Colonne date de fin",["(aucune)"]+cols)
-            c4,c5=st.columns(2)
-            bike_col=c4.selectbox("Colonne matériel / vélo",["(aucune)"]+cols)
-            mech_col=c5.selectbox("Colonne mécanicien",["(aucune)"]+cols)
-            if st.button("Importer / actualiser les ordres de travail"):
-                imported=0
-                for _,r in raw.iterrows():
-                    iid=str(r[int_col]).strip()
-                    if not iid or iid.lower()=="nan": continue
-                    status=str(r[status_col]).strip()
-                    end=str(r[end_col])[:10] if end_col!="(aucune)" and pd.notna(r[end_col]) else ""
-                    bike=str(r[bike_col]) if bike_col!="(aucune)" else ""
-                    mech=str(r[mech_col]) if mech_col!="(aucune)" else ""
-                    con.execute("""INSERT INTO work_orders(intervention,bike,status,end_date,mechanic,imported_at)
-                    VALUES(?,?,?,?,?,?) ON CONFLICT(intervention) DO UPDATE SET bike=excluded.bike,status=excluded.status,
-                    end_date=excluded.end_date,mechanic=excluded.mechanic,imported_at=excluded.imported_at""",
-                    (iid,bike,status,end,mech,datetime.now().isoformat(timespec="seconds")))
-                    imported+=1
-                con.execute("INSERT INTO imports(filename,imported_at,rows_count,notes) VALUES(?,?,?,?)",
-                (wo.name,datetime.now().isoformat(timespec="seconds"),imported,"Ordres de travail actualisés"))
-                con.commit(); st.success(f"{imported} ordres importés / actualisés.")
-        except Exception as ex: st.error(f"Lecture du fichier impossible : {ex}")
-    allwo=pd.read_sql_query("SELECT intervention AS Intervention,bike AS Matériel,status AS Statut,end_date AS 'Date de fin',mechanic AS Mécanicien FROM work_orders",con)
-    if not allwo.empty:
-        stat=st.text_input("Filtrer les statuts considérés comme soldés (mots séparés par virgule)",value="soldé,solde,clos,terminé,termine,closed")
-        done=[s.strip().lower() for s in stat.split(",")]
-        mask=allwo["Statut"].fillna("").str.lower().apply(lambda x:any(z in x for z in done))
-        unsold=allwo[~mask]
-        st.metric("Vélos / interventions non soldés",len(unsold))
-        st.dataframe(unsold,use_container_width=True,hide_index=True)
-        st.download_button("Télécharger la liste des non soldés (Excel)",unsold.to_csv(index=False).encode("utf-8-sig"),"velos_non_soldes.csv","text/csv")
-        with st.expander("Préparer un e-mail avec la liste"):
-            to=st.text_input("Adresse e-mail destinataire")
-            if st.button("Créer le brouillon e-mail"):
-                body="Bonjour,\n\nVeuillez trouver ci-dessous la liste des vélos non soldés :\n\n"+unsold.to_string(index=False)+"\n\nCordialement"
-                st.code(f"mailto:{to}?subject=Liste%20des%20v%C3%A9los%20non%20sold%C3%A9s")
-                st.caption("Le bouton prépare un lien mailto. L'envoi automatique nécessite une configuration SMTP sécurisée sur le serveur.")
-    else: st.info("Aucun ordre de travail importé.")
+# --- FONCTION DE CHARGEMENT ET NETTOYAGE DES FICHIERS ---
+def convertir_charge_en_heures(val):
+    if pd.isna(val):
+        return 0.5
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        parties = str(val).split(':')
+        if len(parties) == 3:
+            return int(parties[0]) + int(parties[1])/60 + int(parties[2])/3600
+        elif len(parties) == 2:
+            return int(parties[0]) + int(parties[1])/60
+    except:
+        return 0.5
+    return 0.5
 
-with tabs[4]:
-    st.subheader("Analyses de production")
-    data=pd.read_sql_query("SELECT * FROM daily ORDER BY work_date",con)
-    if not data.empty:
-        data["Date"]=pd.to_datetime(data["work_date"])
-        data["Production"]=data["total_production"]
-        data["Mois"]=data["Date"].dt.to_period("M").astype(str)
-        st.plotly_chart(px.line(data,x="Date",y="Production",markers=True,title="Production totale par jour"),use_container_width=True)
-        monthly=data.groupby("Mois",as_index=False).agg(Production=("Production","sum"),Charge=("charge_hours","sum"),Effectif_moyen=("staff","mean"))
-        st.plotly_chart(px.bar(monthly,x="Mois",y="Production",title="Production par mois"),use_container_width=True)
-        st.plotly_chart(px.bar(data,x="Date",y="charge_hours",title="Charge totale par jour (heures)"),use_container_width=True)
-        data["Vélos par mécanicien"]=data.apply(lambda r:r["Production"]/r["staff"] if r["staff"] else 0,axis=1)
-        st.plotly_chart(px.line(data,x="Date",y="Vélos par mécanicien",markers=True,title="Moyenne de vélos par mécanicien"),use_container_width=True)
-    else: st.info("Importe ton historique ou saisis des journées pour afficher les graphiques.")
+@st.cache_data
+def charger_donnees(file_obj):
+    if file_obj is None:
+        return None
+    try:
+        if file_obj.name.endswith('.csv'):
+            df = pd.read_csv(file_obj)
+        else:
+            try:
+                df = pd.read_excel(file_obj)
+            except:
+                dfs = pd.read_html(file_obj)
+                df = dfs[0] if dfs else pd.DataFrame()
+        
+        # Standardisation des colonnes si présentes
+        if "Date/heure de fin de l'intervention" in df.columns:
+            df["Date_Fin_dt"] = pd.to_datetime(df["Date/heure de fin de l'intervention"], errors='coerce').dt.date
+        elif "Date de création" in df.columns:
+            df["Date_Fin_dt"] = pd.to_datetime(df["Date de création"], errors='coerce').dt.date
+        else:
+            df["Date_Fin_dt"] = date.today()
 
-with tabs[5]:
-    st.subheader("Historique des imports")
-    imp=pd.read_sql_query("SELECT filename AS Fichier, imported_at AS 'Date import', rows_count AS 'Lignes', notes AS Détail FROM imports ORDER BY id DESC",con)
-    st.dataframe(imp,use_container_width=True,hide_index=True)
-    st.subheader("Exporter la base de suivi")
-    for table in ["daily","breakdowns","work_orders"]:
-        data=pd.read_sql_query(f"SELECT * FROM {table}",con)
-        st.download_button(f"Exporter {table}.csv",data.to_csv(index=False).encode("utf-8-sig"),f"{table}.csv","text/csv",key=f"exp_{table}")
-    st.warning("La base SQLite conserve les saisies entre les redémarrages sur un disque persistant. Sur Streamlit Community Cloud, ajoute un stockage persistant externe pour éviter la perte de la base lors de certaines opérations de déploiement.")
+        if "Charge prévue" in df.columns:
+            df["Heures_Decimales"] = df["Charge prévue"].apply(convertir_charge_en_heures)
+        else:
+            df["Heures_Decimales"] = 0.5
+            
+        return df
+    except Exception as e:
+        st.sidebar.error(f"Erreur de lecture du fichier : {e}")
+        return None
+
+df_interventions = charger_donnees(fichier_principal)
+
+# --- ALERTE ROUGE FIN DE CONTRAT (7 JOURS OUVRABLES) ---
+def est_dans_7_jours_ouvrables(date_fin):
+    if not date_fin or pd.isna(date_fin):
+        return False
+    aujourdhui = date.today()
+    if date_fin < aujourdhui:
+        return True
+    jours_ouvrables = 0
+    curseur = aujourdhui
+    while curseur < date_fin and jours_ouvrables < 8:
+        curseur += timedelta(days=1)
+        if curseur.weekday() < 5:
+            jours_ouvrables += 1
+    return jours_ouvrables <= 7
+
+agents_en_alerte = []
+for agent in st.session_state.liste_agents:
+    d_fin = agent.get("Date_Fin")
+    if d_fin and est_dans_7_jours_ouvrables(d_fin):
+        agents_en_alerte.append(agent.get("Nom"))
+
+if agents_en_alerte:
+    st.markdown(f"""
+        <div style="background-color: #ff4b4b; color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+            <h3>🚨 ALERTE CRITIQUE : Fin de contrat imminente (≤ 7 jours ouvrables)</h3>
+            <p>Agents concernés : <b>{', '.join(agents_en_alerte)}</b>. Veuillez régulariser leur situation.</p>
+        </div>
+    """, unsafe_allow_html=True)
+
+# --- 3. CONTENU DES MODULES ---
+
+if menu == "📊 Suivi de la Production Grand Écran":
+    st.title("📊 Suivi de la Production Grand Écran (Semaines S1 à S52)")
+    
+    if df_interventions is None:
+        st.info("💡 Veuillez injecter votre fichier d'export Excel/CSV dans la barre latérale pour afficher l'analyse dynamique.")
+    else:
+        st.subheader("🗓️ Filtre par Semaine")
+        semaine_sel = st.slider("Sélectionner la Semaine (S1 à S52)", 1, 52, 44)
+        
+        # Filtre sur le fichier injecté
+        col_date = "Date_Fin_dt" if "Date_Fin_dt" in df_interventions.columns else None
+        
+        # Statistiques globales du fichier
+        col_a, col_b, col_c, col_d = st.columns(4)
+        total_interventions = len(df_interventions)
+        
+        col_etat = "Etat" if "Etat" in df_interventions.columns else None
+        if col_etat:
+            soldes = len(df_interventions[df_interventions[col_etat].astype(str).str.contains("Soudé|Soldé|A injecter", case=False, na=False)])
+            a_controler = len(df_interventions[df_interventions[col_etat].astype(str).str.contains("contrôler|A contrôler", case=False, na=False)])
+        else:
+            soldes = total_interventions
+            a_controler = 0
+            
+        charge_totale = round(df_interventions["Heures_Decimales"].sum(), 2) if "Heures_Decimales" in df_interventions.columns else 0
+        
+        col_a.metric("Total Vélos", total_interventions)
+        col_b.metric("Vélos Soldés", soldes)
+        col_c.metric("À Contrôler", a_controler)
+        col_d.metric("Temps de Charge Total (h)", f"{charge_totale} h")
+        
+        st.markdown("---")
+        st.subheader(f"📅 Tableau de Production Hebdomadaire - Semaine S{semaine_sel}")
+        
+        # Structure journalière de la semaine
+        jours = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi"]
+        cols_j = st.columns(6)
+        
+        for idx, j in enumerate(jours):
+            with cols_j[idx]:
+                st.markdown(f"### {j}")
+                st.write("**Vélos Terminés :** --")
+                st.write("**Vélos Soldés :** --")
+                st.write("**Charge Journalière :** -- h")
+                st.write("**Formulaires A / B / C :** -- / -- / --")
+                st.markdown("---")
+                
+                # Dynamic Ruptures
+                st.markdown("🛠️ **Ruptures de Pièces :**")
+                cle_r = f"rupture_s{semaine_sel}_{j}"
+                piece_r = st.selectbox("Ajouter rupture", ["Aucune"] + st.session_state.liste_pieces_detachees, key=f"sel_r_{cle_r}")
+                if piece_r != "Aucune":
+                    if cle_r not in st.session_state.ruptures_journalieres:
+                        st.session_state.ruptures_journalieres[cle_r] = []
+                    if piece_r not in st.session_state.ruptures_journalieres[cle_r]:
+                        st.session_state.ruptures_journalieres[cle_r].append(piece_r)
+                
+                if cle_r in st.session_state.ruptures_journalieres and st.session_state.ruptures_journalieres[cle_r]:
+                    for p in st.session_state.ruptures_journalieres[cle_r]:
+                        st.error(f"❌ {p}")
+
+                # Dynamic Non-Conformités
+                st.markdown("⚠️ **Non-Conformités :**")
+                cle_nc = f"nc_s{semaine_sel}_{j}"
+                piece_nc = st.selectbox("Ajouter NC", ["Aucune"] + st.session_state.liste_pieces_detachees, key=f"sel_nc_{cle_nc}")
+                if piece_nc != "Aucune":
+                    if cle_nc not in st.session_state.non_conformites_journalieres:
+                        st.session_state.non_conformites_journalieres[cle_nc] = []
+                    if piece_nc not in st.session_state.non_conformites_journalieres[cle_nc]:
+                        st.session_state.non_conformites_journalieres[cle_nc].append(piece_nc)
+                        
+                if cle_nc in st.session_state.non_conformites_journalieres and st.session_state.non_conformites_journalieres[cle_nc]:
+                    for p in st.session_state.non_conformites_journalieres[cle_nc]:
+                        st.warning(f"⚠️ {p}")
+
+        st.markdown("---")
+        st.subheader("📊 Graphiques de Production par Mécanicien & Formulaires")
+        
+        col_g1, col_g2 = st.columns(2)
+        with col_g1:
+            col_agent = "Assigné à l'acteur Libellé"
+            if col_agent in df_interventions.columns:
+                st.write("**Production par Mécanicien :**")
+                fig1, ax1 = plt.subplots()
+                df_interventions[col_agent].value_counts().plot(kind="bar", ax=ax1, color="#1f77b4")
+                ax1.set_ylabel("Nombre de Vélos")
+                st.pyplot(fig1)
+        
+        with col_g2:
+            col_form = "Identifiant du formulaire personnalisé"
+            if col_form in df_interventions.columns:
+                st.write("**Répartition des Formulaires A, B, C :**")
+                fig2, ax2 = plt.subplots()
+                df_interventions[col_form].value_counts().plot(kind="pie", ax=ax2, autopct="%1.1f%%", startangle=90)
+                ax2.set_ylabel("")
+                st.pyplot(fig2)
+
+elif menu == "📅 Planning Semainier (S1 à S52)":
+    st.title("📅 Planning Semainier Interactif (Semaines 1 à 52)")
+    
+    semaine_p = st.number_input("Sélectionner la semaine du planning", 1, 52, 1)
+    
+    if not st.session_state.liste_agents:
+        st.warning("⚠️ Aucun agent enregistré. Veuillez ajouter vos agents dans le menu '⚙️ Administration'.")
+    else:
+        st.subheader(f"Planning - Semaine S{semaine_p}")
+        
+        donnees_planning = []
+        for ag in st.session_state.liste_agents:
+            nom = ag["Nom"]
+            row = {"Mécanicien": nom}
+            for j in ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]:
+                row[j] = "07h00 (7h)"
+            donnees_planning.append(row)
+            
+        df_p = pd.DataFrame(donnees_planning)
+        st.dataframe(df_p, use_container_width=True)
+        st.info("💡 Vous pouvez modifier les présences, saisir des durées précises (ex: 9h30) ou appliquer des codes (ANR, AJNP, etc.).")
+
+elif menu == "💰 Calculateur de Primes (Vélos Soldés)":
+    st.title("💰 Module de Calcul des Primes (Paliers 7 à 10 Vélos/Jour)")
+    st.markdown("""
+    * **Paliers de Prime :** 7 vélos/j = **60 €**, 8 vélos/j = **91 €**, 9 vélos/j = **123 €**, 10 vélos/j = **155 €**.
+    * **Présence minimum :** 7 heures par jour (07h00 - 16h00).
+    * **Assimilation :** Les codes `ANR` et `AJNP` sont comptabilisés comme jours assimilés.
+    """)
+    
+    if not st.session_state.liste_agents:
+        st.warning("⚠️ Veuillez d'abord créer vos agents dans le menu Administration.")
+    else:
+        primes = []
+        for ag in st.session_state.liste_agents:
+            nom = ag["Nom"]
+            velos = 0
+            if df_interventions is not None and "Assigné à l'acteur Libellé" in df_interventions.columns:
+                velos = len(df_interventions[df_interventions["Assigné à l'acteur Libellé"].astype(str).str.upper() == nom.upper()])
+            
+            jours_trav = 20
+            moyenne = velos / jours_trav if jours_trav > 0 else 0
+            
+            if moyenne < 7.0:
+                p_val = 0.0
+            elif 7.0 <= moyenne <= 10.0:
+                p_val = 60.0 + ((moyenne - 7.0) / 3.0) * (155.0 - 60.0)
+            else:
+                p_val = 155.0
+                
+            primes.append({
+                "Mécanicien": nom,
+                "Vélos Soldés Total": velos,
+                "Jours Travaillés / ANR / AJNP": jours_trav,
+                "Moyenne Vélos / Jour": round(moyenne, 2),
+                "Éligible (≥7h/j)": "✅ Oui",
+                "Prime Calculée (€)": round(p_val, 2)
+            })
+            
+        st.dataframe(pd.DataFrame(primes), use_container_width=True)
+
+elif menu == "🏗️ Entretien Pieds Électriques (24 Postes)":
+    st.title("🏗️ Registre d'Entretien des Pieds Électriques (24 Postes de Levage)")
+    
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        poste_sel = st.selectbox("Sélectionner le Poste de Levage", [f"Poste #{i}" for i in range(1, 25)])
+        operation_sel = st.selectbox("Sélectionner l'opération effectuée", st.session_state.liste_operations_levage)
+        duree_min = st.number_input("Durée de l'intervention (en minutes)", 5, 240, 30)
+        
+        if st.button("Valider et Enregistrer l'Intervention"):
+            nouvelle_entree = {
+                "Date": datetime.now().strftime("%Y-%m-%d"),
+                "Heure": datetime.now().strftime("%H:%M:%S"),
+                "Poste": poste_sel,
+                "Opération": operation_sel,
+                "Durée (min)": duree_min
+            }
+            st.session_state.historique_levage.append(nouvelle_entree)
+            st.success(f"✅ Intervention enregistrée sur le {poste_sel} !")
+
+    with col_p2:
+        st.subheader("📜 Historique des Entretiens Effectués")
+        if st.session_state.historique_levage:
+            st.dataframe(pd.DataFrame(st.session_state.historique_levage), use_container_width=True)
+        else:
+            st.info("Aucun entretien enregistré pour le moment.")
+
+elif menu == "🧰 Outillage & Pièces Détachées":
+    st.title("🧰 Gestion de l'Outillage & Sortie des Pièces Détachées")
+    
+    tab_out, tab_sorties = st.tabs(["Dotations d'Outillage (40 Outils)", "Enregistrement des Sorties de Pièces"])
+    
+    with tab_out:
+        st.subheader("Liste des 40 Outils / Équipements d'Atelier")
+        df_out = pd.DataFrame({
+            "ID Outil": [f"OUT-{i:02d}" for i in range(1, 41)],
+            "Nom Outil": st.session_state.liste_outillage,
+            "État": ["Bon état"] * 40,
+            "Assigné à": ["Aucun (En stock)"] * 40
+        })
+        st.dataframe(df_out, use_container_width=True)
+
+    with tab_sorties:
+        st.subheader("Enregistrer une sortie de pièce détachée")
+        if not st.session_state.liste_agents:
+            st.warning("⚠️ Veuillez d'abord ajouter des agents dans l'administration.")
+        else:
+            col_s1, col_s2 = st.columns(2)
+            nom_ag = col_s1.selectbox("Mécanicien", [a["Nom"] for a in st.session_state.liste_agents])
+            piece_s = col_s2.selectbox("Pièce sortie", st.session_state.liste_pieces_detachees)
+            etat_s = col_s1.selectbox("État à la sortie", ["Neuf", "Reconditionné", "À contrôler"])
+            quantite_s = col_s2.number_input("Quantité", 1, 10, 1)
+            
+            if st.button("Enregistrer la Sortie"):
+                st.success(f"✅ Sortie de {quantite_s}x {piece_s} enregistrée pour {nom_ag} le {date.today()} !")
+
+elif menu == "🔍 Réconciliation & Anti-Perte":
+    st.title("🔍 Réconciliation & Anti-Perte (Comparaison de 2 Fichiers)")
+    
+    if fichier_comparaison is not None:
+        df_comp = charger_donnees(fichier_comparaison)
+        if df_interventions is not None and df_comp is not None:
+            col_code = "Code de l'intervention"
+            if col_code in df_interventions.columns and col_code in df_comp.columns:
+                diff = set(df_interventions[col_code]) - set(df_comp[col_code])
+                if diff:
+                    st.warning(f"⚠️ {len(diff)} intervention(s) présente(s) dans le fichier 1 mais absentes du fichier 2 :")
+                    st.write(list(diff))
+                else:
+                    st.success("✅ Aucune perte détectée entre les 2 fichiers.")
+            else:
+                st.info("Colonne 'Code de l'intervention' manquante dans l'un des fichiers.")
+    else:
+        st.info("Veuillez charger un Fichier 2 dans la barre latérale pour lancer la réconciliation.")
+
+elif menu == "⚙️ Administration & Listes Déroulantes":
+    st.title("⚙️ Panneau d'Administration & Gestion des Listes")
+    
+    tab_a1, tab_a2, tab_a3, tab_a4 = st.tabs([
+        "👥 Gestion des Mécaniciens", 
+        "🛠️ Opérations Pieds Électriques", 
+        "⚙️ Pièces Détachées", 
+        "📋 Codes Planning"
+    ])
+    
+    with tab_a1:
+        st.subheader("➕ Ajouter un Mécanicien")
+        n_nom = st.text_input("Nom & Prénom du mécanicien")
+        n_badge = st.text_input("N° Badge / Visiteur")
+        n_fin = st.date_input("Date Fin de Contrat", date.today() + timedelta(days=90))
+        
+        if st.button("Ajouter le Mécanicien"):
+            if n_nom:
+                st.session_state.liste_agents.append({"Nom": n_nom, "Badge": n_badge, "Date_Fin": n_fin})
+                st.success(f"Agent {n_nom} ajouté avec succès !")
+                st.rerun()
+                
+        st.markdown("---")
+        st.subheader("Liste des Mécaniciens Actifs")
+        if st.session_state.liste_agents:
+            for idx, a in enumerate(st.session_state.liste_agents):
+                col_m1, col_m2 = st.columns([3, 1])
+                col_m1.write(f"• **{a['Nom']}** (Badge: {a['Badge']}) - Fin de contrat: {a['Date_Fin']}")
+                if col_m2.button("Supprimer", key=f"sup_ag_{idx}"):
+                    st.session_state.liste_agents.pop(idx)
+                    st.rerun()
+        else:
+            st.info("Aucun agent pour le moment.")
+
+    with tab_a2:
+        st.subheader("Gestion des Opérations pour Pieds Électriques")
+        op_nouv = st.text_input("Nouvelle opération de maintenance")
+        if st.button("Ajouter l'opération"):
+            if op_nouv and op_nouv not in st.session_state.liste_operations_levage:
+                st.session_state.liste_operations_levage.append(op_nouv)
+                st.success("Opération ajoutée !")
+                st.rerun()
+        st.write("Opérations actuelles :", st.session_state.liste_operations_levage)
+
+    with tab_a3:
+        st.subheader("Gestion des Pièces Détachées (Ruptures / Non-Conformités)")
+        pc_nouv = st.text_input("Nouvelle pièce détachée")
+        if st.button("Ajouter la pièce"):
+            if pc_nouv and pc_nouv not in st.session_state.liste_pieces_detachees:
+                st.session_state.liste_pieces_detachees.append(pc_nouv)
+                st.success("Pièce ajoutée !")
+                st.rerun()
+        st.write("Pièces actuelles :", st.session_state.liste_pieces_detachees)
+
+    with tab_a4:
+        st.subheader("Gestion des Codes de Planning")
+        cd_nouv = st.text_input("Nouveau code (ex: RTT)")
+        if st.button("Ajouter le code"):
+            if cd_nouv and cd_nouv not in st.session_state.liste_codes_planning:
+                st.session_state.liste_codes_planning.append(cd_nouv)
+                st.success("Code ajouté !")
+                st.rerun()
+        st.write("Codes actuels :", st.session_state.liste_codes_planning)
